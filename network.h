@@ -5,19 +5,23 @@
  *      Author: wangyu
  */
 
-#ifndef NETWORK_H_
-#define NETWORK_H_
+#ifndef UDP2RAW_NETWORK_H_
+#define UDP2RAW_NETWORK_H_
 
 extern int raw_recv_fd;
 extern int raw_send_fd;
 extern int seq_mode;
+extern int max_seq_mode;
 extern int filter_port;
 extern u32_t bind_address_uint32;
 extern int disable_bpf_filter;
 
 extern int lower_level;
+extern int lower_level_manual;
 extern char if_name[100];
-extern unsigned char oppsite_hw_addr[];
+extern unsigned char dest_hw_addr[];
+
+extern int ifindex;
 
 struct icmphdr
 {
@@ -51,6 +55,7 @@ struct packet_info_t  //todo change this to union
 
 	u32_t seq,ack_seq;
 
+	u32_t ack_seq_counter;
 
 	u32_t ts,ts_ack;
 
@@ -58,6 +63,11 @@ struct packet_info_t  //todo change this to union
 	uint16_t icmp_seq;
 
 	bool has_ts;
+
+	sockaddr_ll addr_ll;
+
+	i32_t data_len;
+
 	packet_info_t();
 };
 
@@ -66,10 +76,10 @@ struct raw_info_t
 	packet_info_t send_info;
 	packet_info_t recv_info;
 
-	int last_send_len;
-	int last_recv_len;
+	//int last_send_len;
+	//int last_recv_len;
 
-	u32_t reserved_seq;
+	u32_t reserved_send_seq;
 	//uint32_t first_seq,first_ack_seq;
 
 };//g_raw_info;
@@ -80,8 +90,16 @@ int init_raw_socket();
 void init_filter(int port);
 
 void remove_filter();
-int init_ifindex(char * if_name);
 
+int init_ifindex(const char * if_name,int &index);
+
+int find_lower_level_info(u32_t ip,u32_t &dest_ip,string &if_name,string &hw);
+
+int get_src_adress(u32_t &ip,u32_t remote_ip_uint32,int remote_port);  //a trick to get src adress for a dest adress,so that we can use the src address in raw socket as source ip
+
+int try_to_list_and_bind(int bind_fd,u32_t local_ip_uint32,int port);  //try to bind to a port,may fail.
+
+int client_bind_to_a_new_port(int bind_fd,u32_t local_ip_uint32);//find a free port and bind to it.
 
 int send_raw_ip(raw_info_t &raw_info,const char * payload,int payloadlen);
 

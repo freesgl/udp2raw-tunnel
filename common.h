@@ -5,8 +5,8 @@
  *      Author: wangyu
  */
 
-#ifndef COMMON_H_
-#define COMMON_H_
+#ifndef UDP2RAW_COMMON_H_
+#define UDP2RAW_COMMON_H_
 #define __STDC_FORMAT_MACROS 1
 #include <inttypes.h>
 
@@ -43,11 +43,15 @@
 #include <stdarg.h>
 #include <assert.h>
 #include <linux/if_packet.h>
-
-
-
+#include <byteswap.h>
+#include <pthread.h>
 
 #include<unordered_map>
+#include <fstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
 using  namespace std;
 
 
@@ -57,52 +61,6 @@ typedef long long i64_t;
 typedef unsigned int u32_t;
 typedef int i32_t;
 
-
-const int max_data_len=1600;
-const int buf_len=max_data_len+400;
-const u32_t max_handshake_conn_num=10000;
-const u32_t max_ready_conn_num=1000;
-const u32_t anti_replay_window_size=1000;
-const int max_conv_num=10000;
-
-const u32_t client_handshake_timeout=5000;
-const u32_t client_retry_interval=1000;
-
-const u32_t server_handshake_timeout=10000;// this should be much longer than clients. client retry initially ,server retry passtively
-
-const int conv_clear_ratio=10;  //conv grabage collecter check 1/10 of all conv one time
-const int conn_clear_ratio=30;
-const int conv_clear_min=5;
-const int conn_clear_min=1;
-
-const u32_t conv_clear_interval=1000;
-const u32_t conn_clear_interval=1000;
-
-
-const i32_t max_fail_time=0;//disable
-
-const u32_t heartbeat_interval=1000;
-
-const u32_t timer_interval=400;//this should be smaller than heartbeat_interval and retry interval;
-
-//const uint32_t conv_timeout=120000; //120 second
-const u32_t conv_timeout=30000; //for test
-
-const u32_t client_conn_timeout=10000;
-const u32_t client_conn_uplink_timeout=client_conn_timeout+2000;
-
-//const uint32_t server_conn_timeout=conv_timeout+60000;//this should be 60s+ longer than conv_timeout,so that conv_manager can destruct convs gradually,to avoid latency glicth
-const u32_t server_conn_timeout=conv_timeout+10000;//for test
-
-extern int about_to_exit;
-
-enum raw_mode_t{mode_faketcp=0,mode_udp,mode_icmp,mode_end};
-extern raw_mode_t raw_mode;
-enum program_mode_t {unset_mode=0,client_mode,server_mode};
-extern program_mode_t program_mode;
-extern unordered_map<int, const char*> raw_mode_tostring ;
-extern int socket_buf_size;
-
 typedef u32_t id_t;
 
 typedef u64_t iv_t;
@@ -110,6 +68,9 @@ typedef u64_t iv_t;
 typedef u64_t padding_t;
 
 typedef u64_t anti_replay_seq_t;
+
+const int max_data_len=1600;
+const int buf_len=max_data_len+400;
 
 u64_t get_current_time();
 u64_t pack_u64(u32_t a,u32_t b);
@@ -120,7 +81,6 @@ u32_t get_u64_l(u64_t a);
 
 char * my_ntoa(u32_t ip);
 
-void myexit(int a);
 void init_random_number_fd();
 u64_t get_true_random_number_64();
 u32_t get_true_random_number();
@@ -130,18 +90,35 @@ u64_t hton64(u64_t a);
 bool larger_than_u16(uint16_t a,uint16_t b);
 bool larger_than_u32(u32_t a,u32_t b);
 void setnonblocking(int sock);
-int set_buf_size(int fd);
-
-unsigned short csum(const unsigned short *ptr,int nbytes);
-
-void  signal_handler(int sig);
-int numbers_to_char(id_t id1,id_t id2,id_t id3,char * &data,int &len);
-int char_to_numbers(const char * data,int len,id_t &id1,id_t &id2,id_t &id3);
+int set_buf_size(int fd,int socket_buf_size,int force_socket_buf);
 
 void myexit(int a);
 
-int add_iptables_rule(char *);
+unsigned short csum(const unsigned short *ptr,int nbytes);
 
-int clear_iptables_rule();
+int numbers_to_char(id_t id1,id_t id2,id_t id3,char * &data,int &len);
+int char_to_numbers(const char * data,int len,id_t &id1,id_t &id2,id_t &id3);
+
+const int show_none=0;
+const int show_command=0x1;
+const int show_log=0x2;
+const int show_all=show_command|show_log;
+
+int run_command(string command,char * &output,int flag=show_all);
+//int run_command_no_log(string command,char * &output);
+int read_file(const char * file,string &output);
+
+vector<string> string_to_vec(const char * s,const char * sp);
+vector< vector <string> > string_to_vec2(const char * s);
+
+string trim(const string& str, char c);
+
+string trim_conf_line(const string& str);
+
+vector<string> parse_conf_line(const string& s);
+
+int hex_to_u32_with_endian(const string & a,u32_t &output);
+int hex_to_u32(const string & a,u32_t &output);
+//extern string iptables_pattern;
 
 #endif /* COMMON_H_ */

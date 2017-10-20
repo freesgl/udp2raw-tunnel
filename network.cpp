@@ -7,12 +7,14 @@
 #include "common.h"
 #include "network.h"
 #include "log.h"
+#include "misc.h"
 
 int raw_recv_fd=-1;
 int raw_send_fd=-1;
 u32_t link_level_header_len=0;//set it to 14 if SOCK_RAW is used in socket(PF_PACKET, SOCK_RAW, htons(ETH_P_IP));
 
-int seq_mode=2;
+int seq_mode=3;
+int max_seq_mode=4;
 
 int filter_port=-1;
 
@@ -21,14 +23,19 @@ int disable_bpf_filter=0;  //for test only,most time no need to disable this
 u32_t bind_address_uint32=0;
 
 int lower_level=0;
+int lower_level_manual=0;
 int ifindex=-1;
 char if_name[100]="";
 
 unsigned short g_ip_id_counter=0;
 
-unsigned char oppsite_hw_addr[6]=
-    {0xff,0xff,0xff,0xff,0xff,0xff};
+unsigned char dest_hw_addr[sizeof(sockaddr_ll::sll_addr)]=
+    {0xff,0xff,0xff,0xff,0xff,0xff,0,0};
 //{0x00,0x23,0x45,0x67,0x89,0xb9};
+
+const u32_t receive_window_lower_bound=40960;
+const u32_t receive_window_random_range=512;
+const unsigned char wscale=0x05;
 
 struct sock_filter code_tcp_old[] = {
 		{ 0x28, 0, 0, 0x0000000c },//0
@@ -46,8 +53,8 @@ struct sock_filter code_tcp_old[] = {
 		{ 0x6, 0, 0, 0x00000000 },//12
 };
 struct sock_filter code_tcp[] = {
-{ 0x5, 0, 0, 0x00000001 },//0    //jump to 2,dirty hack from tcpdump -d's output
-{ 0x5, 0, 0, 0x00000000 },//1
+//{ 0x5, 0, 0, 0x00000001 },//0    //jump to 2,dirty hack from tcpdump -d's output
+//{ 0x5, 0, 0, 0x00000000 },//1
 { 0x30, 0, 0, 0x00000009 },//2
 { 0x15, 0, 6, 0x00000006 },//3
 { 0x28, 0, 0, 0x00000006 },//4
@@ -58,11 +65,11 @@ struct sock_filter code_tcp[] = {
 { 0x6, 0, 0, 0x0000ffff },//9
 { 0x6, 0, 0, 0x00000000 },//10
 };
-int code_tcp_port_index=8;
+int code_tcp_port_index=6;
 
 struct sock_filter code_udp[] = {
-{ 0x5, 0, 0, 0x00000001 },
-{ 0x5, 0, 0, 0x00000000 },
+//{ 0x5, 0, 0, 0x00000001 },
+//{ 0x5, 0, 0, 0x00000000 },
 { 0x30, 0, 0, 0x00000009 },
 { 0x15, 0, 6, 0x00000011 },
 { 0x28, 0, 0, 0x00000006 },
@@ -73,10 +80,10 @@ struct sock_filter code_udp[] = {
 { 0x6, 0, 0, 0x0000ffff },
 { 0x6, 0, 0, 0x00000000 },
 };
-int code_udp_port_index=8;
+int code_udp_port_index=6;
 struct sock_filter code_icmp[] = {
-{ 0x5, 0, 0, 0x00000001 },
-{ 0x5, 0, 0, 0x00000000 },
+//{ 0x5, 0, 0, 0x00000001 },
+//{ 0x5, 0, 0, 0x00000000 },
 { 0x30, 0, 0, 0x00000009 },
 { 0x15, 0, 1, 0x00000001 },
 { 0x6, 0, 0, 0x0000ffff },
@@ -145,6 +152,7 @@ packet_info_t::packet_info_t()
 		ts_ack=0;
 		syn=0;
 		ack=1;
+		ack_seq_counter=0;
 
 		//mylog(log_info,"<cons ,ts_ack= %u>\n",ts_ack);
 	}
@@ -194,15 +202,26 @@ int init_raw_socket()
 	        //perror("Failed to create raw_send_fd");
 	        myexit(1);
 	    }
-		init_ifindex(if_name);
+		//init_ifindex(if_name);
 
 	}
 
-    if(setsockopt(raw_send_fd, SOL_SOCKET, SO_SNDBUFFORCE, &socket_buf_size, sizeof(socket_buf_size))<0)
-    {
-    	mylog(log_fatal,"SO_SNDBUFFORCE fail\n");
-    	myexit(1);
-    }
+	if(force_socket_buf)
+	{
+		if(setsockopt(raw_send_fd, SOL_SOCKET, SO_SNDBUFFORCE, &socket_buf_size, sizeof(socket_buf_size))<0)
+		{
+			mylog(log_fatal,"SO_SNDBUFFORCE fail  socket_buf_size=%d  errno=%s\n",socket_buf_size,strerror(errno));
+			myexit(1);
+		}
+	}
+	else
+	{
+		if(setsockopt(raw_send_fd, SOL_SOCKET, SO_SNDBUF, &socket_buf_size, sizeof(socket_buf_size))<0)
+		{
+			mylog(log_fatal,"SO_SNDBUF fail  socket_buf_size=%d  errno=%s\n",socket_buf_size,strerror(errno));
+			myexit(1);
+		}
+	}
 
 
 
@@ -216,11 +235,22 @@ int init_raw_socket()
         myexit(1);
     }
 
-    if(setsockopt(raw_recv_fd, SOL_SOCKET, SO_RCVBUFFORCE, &socket_buf_size, sizeof(socket_buf_size))<0)
-    {
-    	mylog(log_fatal,"SO_RCVBUFFORCE fail\n");
-    	myexit(1);
-    }
+	if(force_socket_buf)
+	{
+		if(setsockopt(raw_recv_fd, SOL_SOCKET, SO_RCVBUFFORCE, &socket_buf_size, sizeof(socket_buf_size))<0)
+		{
+			mylog(log_fatal,"SO_RCVBUFFORCE fail  socket_buf_size=%d  errno=%s\n",socket_buf_size,strerror(errno));
+			myexit(1);
+		}
+	}
+	else
+	{
+		if(setsockopt(raw_recv_fd, SOL_SOCKET, SO_RCVBUF, &socket_buf_size, sizeof(socket_buf_size))<0)
+		{
+			mylog(log_fatal,"SO_RCVBUF fail  socket_buf_size=%d  errno=%s\n",socket_buf_size,strerror(errno));
+			myexit(1);
+		}
+	}
 
     //IP_HDRINCL to tell the kernel that headers are included in the packet
 
@@ -288,7 +318,7 @@ void remove_filter()
 		//exit(-1);
 	}
 }
-int init_ifindex(char * if_name)
+int init_ifindex(const char * if_name,int &index)
 {
 	struct ifreq ifr;
 	size_t if_name_len=strlen(if_name);
@@ -304,10 +334,230 @@ int init_ifindex(char * if_name)
 		mylog(log_fatal,"SIOCGIFINDEX fail ,%s\n",strerror(errno));
 		myexit(-1);
 	}
-	ifindex=ifr.ifr_ifindex;
-	mylog(log_info,"ifname:%s  ifindex:%d\n",if_name,ifindex);
+	index=ifr.ifr_ifindex;
+	mylog(log_info,"ifname:%s  ifindex:%d\n",if_name,index);
 	return 0;
 }
+bool interface_has_arp(const char * interface) {
+    struct ifreq ifr;
+   // int sock = socket(PF_INET6, SOCK_DGRAM, IPPROTO_IP);
+    int sock=raw_send_fd;
+    memset(&ifr, 0, sizeof(ifr));
+    strcpy(ifr.ifr_name, interface);
+    if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
+            //perror("SIOCGIFFLAGS");
+    		mylog(log_fatal,"ioctl(sock, SIOCGIFFLAGS, &ifr) failed for interface %s,errno %s\n",interface,strerror(errno));
+            myexit(-1);
+    }
+    //close(sock);
+    return !(ifr.ifr_flags & IFF_NOARP);
+}
+struct route_info_t
+{
+	string if_name;
+	u32_t dest;
+	u32_t mask;
+	u32_t gw;
+	u32_t flag;
+
+};
+int dest_idx=1;
+int gw_idx=2;
+int if_idx=0;
+int mask_idx=7;
+int flag_idx=3;
+vector<int> find_route_entry(const vector<route_info_t> &route_info_vec,u32_t ip)
+{
+	vector<int> res;
+	for(u32_t i=0;i<=32;i++)
+	{
+		u32_t mask=0xffffffff;
+		//mask >>=i;
+		//if(i==32) mask=0;  //why 0xffffffff>>32  equals 0xffffffff??
+
+		mask <<=i;
+		if(i==32) mask=0;
+		log_bare(log_debug,"(mask:%x)",mask);
+		for(u32_t j=0;j<route_info_vec.size();j++)
+		{
+			const route_info_t & info=route_info_vec[j];
+			if(info.mask!=mask)
+				continue;
+			log_bare(log_debug,"<<%d,%d>>",i,j);
+			if((info.dest&mask)==(ip&mask))
+			{
+				log_bare(log_debug,"found!");
+				res.push_back(j);
+			}
+		}
+		if(res.size()!=0)
+		{
+			return res;
+		}
+	}
+	return res;
+}
+int find_direct_dest(const vector<route_info_t> &route_info_vec,u32_t ip,u32_t &dest_ip,string &if_name)
+{
+	vector<int> res;
+	for(int i=0;i<1000;i++)
+	{
+		res=find_route_entry(route_info_vec,ip);
+		log_bare(log_debug,"<entry:%u>",(u32_t)res.size());
+		if(res.size()==0)
+		{
+			mylog(log_error,"cant find route entry\n");
+			return -1;
+		}
+		if(res.size()>1)
+		{
+			mylog(log_error,"found duplicated entries\n");
+			return -1;
+		}
+		if((route_info_vec[res[0]].flag&2)==0)
+		{
+			dest_ip=ip;
+			if_name=route_info_vec[res[0]].if_name;
+			return 0;
+		}
+		else
+		{
+			ip=route_info_vec[res[0]].gw;
+		}
+	}
+	mylog(log_error,"dead loop in find_direct_dest\n");
+	return -1;
+}
+struct arp_info_t
+{
+	u32_t ip;
+	string hw;
+	string if_name;
+};
+int arp_ip_idx=0;
+int arp_hw_idx=3;
+int arp_if_idx=5;
+
+
+int find_arp(const vector<arp_info_t> &arp_info_vec,u32_t ip,string if_name,string &hw)
+{
+	int pos=-1;
+	int count=0;
+	for(u32_t i=0;i<arp_info_vec.size();i++)
+	{
+		const arp_info_t & info=arp_info_vec[i];
+		if(info.if_name!=if_name) continue;
+		if(info.ip==ip)
+		{
+			count++;
+			pos=i;
+		}
+	}
+	if(count==0)
+	{
+		//mylog(log_warn,"cant find arp entry for %s %s,using 00:00:00:00:00:00\n",my_ntoa(ip),if_name.c_str());
+		//hw="00:00:00:00:00:00";
+		mylog(log_error,"cant find arp entry for %s %s\n",my_ntoa(ip),if_name.c_str());
+		return -1;
+	}
+	if(count>1)
+	{
+		mylog(log_error,"find multiple arp entry for %s %s\n",my_ntoa(ip),if_name.c_str());
+		return -1;
+	}
+	hw=arp_info_vec[pos].hw;
+	return 0;
+}
+int find_lower_level_info(u32_t ip,u32_t &dest_ip,string &if_name,string &hw)
+{
+	ip=htonl(ip);
+	if(ip==htonl(inet_addr("127.0.0.1")))
+	{
+		dest_ip=ntohl(ip);
+		if_name="lo";
+		hw="00:00:00:00:00:00";
+		return 0;
+	}
+
+	string route_file;
+	if(read_file("/proc/net/route",route_file)!=0) return -1;
+	string arp_file;
+	if(read_file("/proc/net/arp",arp_file)!=0) return -1;
+
+	log_bare(log_debug,"/proc/net/route:<<%s>>\n",route_file.c_str());
+	log_bare(log_debug,"/proc/net/arp:<<%s>>\n",route_file.c_str());
+
+	auto route_vec2=string_to_vec2(route_file.c_str());
+	vector<route_info_t> route_info_vec;
+	for(u32_t i=1;i<route_vec2.size();i++)
+	{
+		log_bare(log_debug,"<size:%u>",(u32_t)route_vec2[i].size());
+		if(route_vec2[i].size()!=11)
+		{
+			mylog(log_error,"route coloum %d !=11 \n",int(route_vec2[i].size()));
+			return -1;
+		}
+		route_info_t tmp;
+		tmp.if_name=route_vec2[i][if_idx];
+		if(hex_to_u32_with_endian(route_vec2[i][dest_idx],tmp.dest)!=0) return -1;
+		if(hex_to_u32_with_endian(route_vec2[i][gw_idx],tmp.gw)!=0) return -1;
+		if(hex_to_u32_with_endian(route_vec2[i][mask_idx],tmp.mask)!=0) return -1;
+		if(hex_to_u32(route_vec2[i][flag_idx],tmp.flag)!=0)return -1;
+		route_info_vec.push_back(tmp);
+		for(u32_t j=0;j<route_vec2[i].size();j++)
+		{
+			log_bare(log_debug,"<%s>",route_vec2[i][j].c_str());
+		}
+		log_bare(log_debug,"%s dest:%x mask:%x gw:%x flag:%x",tmp.if_name.c_str(),tmp.dest,tmp.mask,tmp.gw,tmp.flag);
+		log_bare(log_debug,"\n");
+	}
+
+	if(find_direct_dest(route_info_vec,ip,dest_ip,if_name)!=0)
+	{
+		mylog(log_error,"find_direct_dest failed for ip %s\n",my_ntoa(ntohl(ip)));
+		return -1;
+	}
+
+
+	log_bare(log_debug,"========\n");
+	auto arp_vec2=string_to_vec2(arp_file.c_str());
+	vector<arp_info_t> arp_info_vec;
+	for(u32_t i=1;i<arp_vec2.size();i++)
+	{
+		log_bare(log_debug,"<<arp_vec2[i].size(): %d>>",(int)arp_vec2[i].size());
+
+		for(u32_t j=0;j<arp_vec2[i].size();j++)
+		{
+			log_bare(log_debug,"<%s>",arp_vec2[i][j].c_str());
+		}
+		if(arp_vec2[i].size()!=6)
+		{
+			mylog(log_error,"arp coloum %d !=11 \n",int(arp_vec2[i].size()));
+			return -1;
+		}
+		arp_info_t tmp;
+		tmp.if_name=arp_vec2[i][arp_if_idx];
+		tmp.hw=arp_vec2[i][arp_hw_idx];
+		tmp.ip=htonl(inet_addr(arp_vec2[i][arp_ip_idx].c_str()));
+		arp_info_vec.push_back(tmp);
+		log_bare(log_debug,"\n");
+	}
+	if(!interface_has_arp(if_name.c_str()))
+	{
+		mylog(log_info,"%s is a noarp interface,using 00:00:00:00:00:00\n",if_name.c_str());
+		hw="00:00:00:00:00:00";
+	}
+	else if(find_arp(arp_info_vec,dest_ip,if_name,hw)!=0)
+	{
+		mylog(log_error,"find_arp failed for dest_ip %s ,if_name %s\n",my_ntoa(ntohl(ip)),if_name.c_str());
+		return -1;
+	}
+	//printf("%s\n",hw.c_str());
+
+	dest_ip=ntohl(dest_ip);
+	return 0;
+}
+
 
 int send_raw_ip(raw_info_t &raw_info,const char * payload,int payloadlen)
 {
@@ -364,14 +614,9 @@ int send_raw_ip(raw_info_t &raw_info,const char * payload,int payloadlen)
     else
     {
 
-    	struct sockaddr_ll addr={0};
-    	//memset(&addr,0,sizeof(addr));
+    	struct sockaddr_ll addr={0};  //={0} not necessary
+    	memcpy(&addr,&send_info.addr_ll,sizeof(addr));
 
-    	addr.sll_family=AF_PACKET;
-    	addr.sll_ifindex=ifindex;
-    	addr.sll_halen=ETHER_ADDR_LEN;
-    	addr.sll_protocol=htons(ETH_P_IP);
-    	memcpy(addr.sll_addr,oppsite_hw_addr,ETHER_ADDR_LEN);
     	ret = sendto(raw_send_fd, send_raw_ip_buf, ip_tot_len ,  0, (struct sockaddr *) &addr, sizeof (addr));
     }
     if(ret==-1)
@@ -455,10 +700,10 @@ int recv_raw_ip(raw_info_t &raw_info,char * &payload,int &payloadlen)
 	static char recv_raw_ip_buf[buf_len];
 
 	iphdr *  iph;
-	struct sockaddr saddr={0};
+	struct sockaddr_ll saddr={0};
 	socklen_t saddr_size = sizeof(saddr);
 	int flag=0;
-	int recv_len = recvfrom(raw_recv_fd, recv_raw_ip_buf, max_data_len, flag ,&saddr , &saddr_size);
+	int recv_len = recvfrom(raw_recv_fd, recv_raw_ip_buf, max_data_len, flag ,(sockaddr*)&saddr , &saddr_size);
 
 	if(recv_len<0)
 	{
@@ -485,6 +730,10 @@ int recv_raw_ip(raw_info_t &raw_info,char * &payload,int &payloadlen)
 	recv_info.dst_ip=iph->daddr;
 	recv_info.protocol=iph->protocol;
 
+	if(lower_level)
+	{
+		memcpy(&recv_info.addr_ll,&saddr,sizeof(recv_info.addr_ll));
+	}
 
 
 	if(bind_address_uint32!=0 &&recv_info.dst_ip!=bind_address_uint32)
@@ -624,8 +873,8 @@ int send_raw_tcp(raw_info_t &raw_info,const char * payload, int payloadlen) {  	
 
 	//mylog(log_debug,"syn %d\n",send_info.syn);
 
-	char send_raw_tcp_buf0[buf_len];
-	char *send_raw_tcp_buf=send_raw_tcp_buf0;
+	char send_raw_tcp_buf[buf_len];
+	//char *send_raw_tcp_buf=send_raw_tcp_buf0;
 
 	struct tcphdr *tcph = (struct tcphdr *) (send_raw_tcp_buf
 			+ sizeof(struct pseudo_header));
@@ -664,20 +913,26 @@ int send_raw_tcp(raw_info_t &raw_info,const char * payload, int payloadlen) {  	
 		send_raw_tcp_buf[i++] = 0x08;   //ts   i=6
 		send_raw_tcp_buf[i++] = 0x0a;   //i=7
 
-		*(u32_t*) (&send_raw_tcp_buf[i]) = htonl(
-				(u32_t) get_current_time());
+		//*(u32_t*) (&send_raw_tcp_buf[i]) = htonl(
+			//	(u32_t) get_current_time());
+
+		u32_t ts=htonl((u32_t) get_current_time());
+		memcpy(&send_raw_tcp_buf[i],&ts,sizeof(ts));
 
 		i += 4;
 
 		//mylog(log_info,"[syn]<send_info.ts_ack= %u>\n",send_info.ts_ack);
 
-		*(u32_t*) (&send_raw_tcp_buf[i]) = htonl(send_info.ts_ack);
+		//*(u32_t*) (&send_raw_tcp_buf[i]) = htonl(send_info.ts_ack);
+		u32_t ts_ack=htonl(send_info.ts_ack);
+		memcpy(&send_raw_tcp_buf[i],&ts_ack,sizeof(ts_ack));
+
 		i += 4;
 
 		send_raw_tcp_buf[i++] = 0x01;
 		send_raw_tcp_buf[i++] = 0x03;
 		send_raw_tcp_buf[i++] = 0x03;
-		send_raw_tcp_buf[i++] = 0x05;
+		send_raw_tcp_buf[i++] = wscale;
 	} else {
 		tcph->doff = 8;
 		int i = sizeof(pseudo_header)+sizeof(tcphdr);
@@ -688,20 +943,25 @@ int send_raw_tcp(raw_info_t &raw_info,const char * payload, int payloadlen) {  	
 		send_raw_tcp_buf[i++] = 0x08;  //ts   //i=2
 		send_raw_tcp_buf[i++] = 0x0a; 		  //i=3;
 
-		*(u32_t*) (&send_raw_tcp_buf[i]) = htonl(
-				(u32_t) get_current_time());
+		//*(u32_t*) (&send_raw_tcp_buf[i]) = htonl(
+			//	(u32_t) get_current_time());
+
+		u32_t ts=htonl((u32_t) get_current_time());
+		memcpy(&send_raw_tcp_buf[i],&ts,sizeof(ts));
 
 		i += 4;
 
 		//mylog(log_info,"<send_info.ts_ack= %u>\n",send_info.ts_ack);
 
-		*(u32_t*) (&send_raw_tcp_buf[i]) = htonl(send_info.ts_ack);
+		//*(u32_t*) (&send_raw_tcp_buf[i]) = htonl(send_info.ts_ack);
+		u32_t ts_ack=htonl(send_info.ts_ack);
+		memcpy(&send_raw_tcp_buf[i],&ts_ack,sizeof(ts_ack));
 		i += 4;
 	}
 
 	tcph->urg = 0;
 	//tcph->window = htons((uint16_t)(1024));
-	tcph->window = htons((uint16_t) (10240 + random() % 100));
+	tcph->window = htons((uint16_t) (receive_window_lower_bound + random() % receive_window_random_range));
 
 	tcph->check = 0; //leave checksum 0 now, filled later by pseudo header
 	tcph->urg_ptr = 0;
@@ -728,7 +988,7 @@ int send_raw_tcp(raw_info_t &raw_info,const char * payload, int payloadlen) {  	
 	}
 
 
-	raw_info.last_send_len=payloadlen;
+	raw_info.send_info.data_len=payloadlen;
 	return 0;
 }
 /*
@@ -1114,8 +1374,14 @@ int recv_raw_tcp(raw_info_t &raw_info,char * &payload,int &payloadlen)
     	if(tcp_option[6]==0x08 &&tcp_option[7]==0x0a)
     	{
     		recv_info.has_ts=1;
-    		recv_info.ts=ntohl(*(u32_t*)(&tcp_option[8]));
-    		recv_info.ts_ack=ntohl(*(u32_t*)(&tcp_option[12]));
+    		//recv_info.ts=ntohl(*(u32_t*)(&tcp_option[8]));
+    		memcpy(&recv_info.ts,&tcp_option[8],sizeof(recv_info.ts));
+    		recv_info.ts=ntohl(recv_info.ts);
+
+    		//recv_info.ts_ack=ntohl(*(u32_t*)(&tcp_option[12]));
+    		memcpy(&recv_info.ts_ack,&tcp_option[12],sizeof(recv_info.ts_ack));
+    		recv_info.ts_ack=ntohl(recv_info.ts_ack);
+
     		//g_packet_info_send.ts_ack= ntohl(*(uint32_t*)(&tcp_option[8]));
     	}
     	else
@@ -1128,8 +1394,12 @@ int recv_raw_tcp(raw_info_t &raw_info,char * &payload,int &payloadlen)
     	if(tcp_option[2]==0x08 &&tcp_option[3]==0x0a)
     	{
     		recv_info.has_ts=1;
-    		recv_info.ts=ntohl(*(u32_t*)(&tcp_option[4]));
-    		recv_info.ts_ack=ntohl(*(u32_t*)(&tcp_option[8]));
+    		//recv_info.ts=ntohl(*(u32_t*)(&tcp_option[4]));
+    		memcpy(&recv_info.ts,&tcp_option[4],sizeof(recv_info.ts));
+    		recv_info.ts=ntohl(recv_info.ts);
+    		//recv_info.ts_ack=ntohl(*(u32_t*)(&tcp_option[8]));
+    		memcpy(&recv_info.ts_ack,&tcp_option[8],sizeof(recv_info.ts_ack));
+    		recv_info.ts_ack=ntohl(recv_info.ts_ack);
     		//g_packet_info_send.ts_ack= ntohl(*(uint32_t*)(&tcp_option[0]));
     	}
     	else
@@ -1150,7 +1420,20 @@ int recv_raw_tcp(raw_info_t &raw_info,char * &payload,int &payloadlen)
     recv_info.dst_port=ntohs(tcph->dest);
 
     recv_info.seq=ntohl(tcph->seq);
+
+   // recv_info.last_last_ack_seq=recv_info.last_ack_seq;
+    //recv_info.last_ack_seq=recv_info.ack_seq;
+    u32_t last_ack_seq=recv_info.ack_seq;
     recv_info.ack_seq=ntohl(tcph->ack_seq);
+    if(recv_info.ack_seq==last_ack_seq)
+    {
+    	recv_info.ack_seq_counter++;
+    }
+    else
+    {
+    	recv_info.ack_seq_counter=0;
+    }
+
     recv_info.psh=tcph->psh;
 
     if(tcph->rst==1)
@@ -1171,7 +1454,7 @@ int recv_raw_tcp(raw_info_t &raw_info,char * &payload,int &payloadlen)
 	{
 		send_info.ack_seq=recv_info.seq;
 	}*/
-    raw_info.last_recv_len=payloadlen;
+    raw_info.recv_info.data_len=payloadlen;
     return 0;
 }
 /*
@@ -1373,18 +1656,47 @@ int after_send_raw0(raw_info_t &raw_info)
 
 	if(raw_mode==mode_faketcp)
 	{
-		if (send_info.syn == 0 && send_info.ack == 1&& raw_info.last_send_len != 0)   //only modify   send_info when the packet is not part of handshake
+		if (send_info.syn == 0 && send_info.ack == 1&& raw_info.send_info.data_len != 0)   //only modify   send_info when the packet is not part of handshake
 		{
 			if (seq_mode == 0)
 			{
 
 			} else if (seq_mode == 1)
 			{
-				send_info.seq += raw_info.last_send_len;    //////////////////modify
+				send_info.seq += raw_info.send_info.data_len;    //////////////////modify
 			} else if (seq_mode == 2)
 			{
 				if (random() % 5 == 3)
-					send_info.seq += raw_info.last_send_len; //////////////////modify
+					send_info.seq += raw_info.send_info.data_len; //////////////////modify
+			}
+			else if(seq_mode==3||seq_mode==4)
+			{
+				send_info.seq += raw_info.send_info.data_len;
+
+				u32_t window_size;
+
+				if(seq_mode==3)
+				{
+					window_size=(u32_t)((u32_t)receive_window_lower_bound<<(u32_t)wscale);
+				}
+				else//seq_mode==4
+				{
+					window_size=(u32_t)((u32_t)receive_window_lower_bound);
+				}
+
+				if(larger_than_u32(send_info.seq+max_data_len,recv_info.ack_seq+window_size))
+				{
+					send_info.seq=raw_info.recv_info.ack_seq;
+				}
+				if(recv_info.ack_seq_counter>=3) //simulate tcp fast re-transmit
+				{
+					recv_info.ack_seq_counter=0;
+					send_info.seq=raw_info.recv_info.ack_seq;
+				}
+				if(larger_than_u32(raw_info.recv_info.ack_seq,send_info.seq))  //for further use,currently no effect.
+				{
+					send_info.seq=raw_info.recv_info.ack_seq;
+				}
 			}
 		}
 	}
@@ -1406,10 +1718,21 @@ int after_recv_raw0(raw_info_t &raw_info)
 	{
 		if(recv_info.has_ts)
 			send_info.ts_ack=recv_info.ts;
-		if (recv_info.syn == 0 && recv_info.ack == 1 && raw_info.last_recv_len != 0) //only modify   send_info when the packet is not part of handshake
+		if (recv_info.syn == 0 && recv_info.ack == 1 && raw_info.recv_info.data_len != 0) //only modify   send_info when the packet is not part of handshake
 		{
-			if(larger_than_u32(recv_info.seq+raw_info.last_recv_len,send_info.ack_seq))
-				send_info.ack_seq = recv_info.seq+raw_info.last_recv_len;//TODO only update if its larger
+			if(seq_mode==0||seq_mode==1||seq_mode==2)
+			{
+				if(larger_than_u32(recv_info.seq+raw_info.recv_info.data_len,send_info.ack_seq))
+					send_info.ack_seq = recv_info.seq+raw_info.recv_info.data_len;//TODO only update if its larger
+			}
+			else if(seq_mode==3||seq_mode==4)
+			{
+				if(recv_info.seq==send_info.ack_seq)
+				{
+					send_info.ack_seq=recv_info.seq+raw_info.recv_info.data_len;//currently we dont remembr tcp segments,this is the simplest way
+					//TODO implement tcp segment remembering and SACK.
+				}
+			}
 		}
 	}
 	if(raw_mode==mode_icmp)
@@ -1450,3 +1773,96 @@ int recv_raw(raw_info_t &raw_info,char *& payload,int & payloadlen)
 	}
 }*/
 
+int get_src_adress(u32_t &ip,u32_t remote_ip_uint32,int remote_port)  //a trick to get src adress for a dest adress,so that we can use the src address in raw socket as source ip
+{
+	struct sockaddr_in remote_addr_in={0};
+
+	socklen_t slen = sizeof(sockaddr_in);
+	//memset(&remote_addr_in, 0, sizeof(remote_addr_in));
+	remote_addr_in.sin_family = AF_INET;
+	remote_addr_in.sin_port = htons(remote_port);
+	remote_addr_in.sin_addr.s_addr = remote_ip_uint32;
+
+
+	int new_udp_fd=socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if(new_udp_fd<0)
+	{
+		mylog(log_warn,"create udp_fd error\n");
+		return -1;
+	}
+	//set_buf_size(new_udp_fd);
+
+	mylog(log_debug,"created new udp_fd %d\n",new_udp_fd);
+	int ret = connect(new_udp_fd, (struct sockaddr *) &remote_addr_in, slen);
+	if(ret!=0)
+	{
+		mylog(log_warn,"udp fd connect fail\n");
+		close(new_udp_fd);
+		return -1;
+	}
+
+	struct sockaddr_in my_addr={0};
+	socklen_t len=sizeof(my_addr);
+
+    if(getsockname(new_udp_fd, (struct sockaddr *) &my_addr, &len)!=0) return -1;
+
+    ip=my_addr.sin_addr.s_addr;
+
+    close(new_udp_fd);
+
+    return 0;
+}
+
+int try_to_list_and_bind(int bind_fd,u32_t local_ip_uint32,int port)  //try to bind to a port,may fail.
+{
+	 int old_bind_fd=bind_fd;
+
+	 if(raw_mode==mode_faketcp)
+	 {
+		 bind_fd=socket(AF_INET,SOCK_STREAM,0);
+	 }
+	 else  if(raw_mode==mode_udp||raw_mode==mode_icmp)
+	 {
+		 bind_fd=socket(AF_INET,SOCK_DGRAM,0);
+	 }
+     if(old_bind_fd!=-1)
+     {
+    	 close(old_bind_fd);
+     }
+
+	 struct sockaddr_in temp_bind_addr={0};
+     //bzero(&temp_bind_addr, sizeof(temp_bind_addr));
+
+     temp_bind_addr.sin_family = AF_INET;
+     temp_bind_addr.sin_port = htons(port);
+     temp_bind_addr.sin_addr.s_addr = local_ip_uint32;
+
+     if (bind(bind_fd, (struct sockaddr*)&temp_bind_addr, sizeof(temp_bind_addr)) !=0)
+     {
+    	 mylog(log_debug,"bind fail\n");
+    	 return -1;
+     }
+	 if(raw_mode==mode_faketcp)
+	 {
+
+		if (listen(bind_fd, SOMAXCONN) != 0) {
+			mylog(log_warn,"listen fail\n");
+			return -1;
+		}
+	 }
+     return 0;
+}
+int client_bind_to_a_new_port(int bind_fd,u32_t local_ip_uint32)//find a free port and bind to it.
+{
+	int raw_send_port=10000+get_true_random_number()%(65535-10000);
+	for(int i=0;i<1000;i++)//try 1000 times at max,this should be enough
+	{
+		if (try_to_list_and_bind(bind_fd,local_ip_uint32,raw_send_port)==0)
+		{
+			return raw_send_port;
+		}
+	}
+	mylog(log_fatal,"bind port fail\n");
+	myexit(-1);
+	return -1;////for compiler check
+}
